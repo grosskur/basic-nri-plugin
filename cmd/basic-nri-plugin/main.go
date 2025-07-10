@@ -4,7 +4,11 @@ import (
 	"context"
 	"flag"
 	"log"
+	"os"
+	"os/signal"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/grosskur/basic-nri-plugin/internal/nriplugin"
@@ -19,6 +23,7 @@ const (
 
 	registrationTimeout = 5 * time.Second
 	requestTimeout      = 2 * time.Second
+	shutdownDelay       = 2 * time.Second
 )
 
 func main() {
@@ -55,10 +60,38 @@ func run() error {
 	})
 
 	ctx := context.Background()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	log.Println("main: starting")
-	if err := p.Run(ctx); err != nil {
-		return err
+	ctxStop, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		log.Println("main: plugin starting")
+		if err := p.Run(ctx); err != nil {
+			log.Printf("main: plugin finished with error: %v", err)
+		} else {
+			log.Println("main: plugin finished successfully")
+		}
+		wg.Done()
+	}()
+
+	select {
+	case <-ctxStop.Done():
+		break
+	case <-ctx.Done():
+		break
 	}
+
+	log.Println("main: received shutdown signal, waiting to shut down: delay=%s", shutdownDelay)
+	time.Sleep(shutdownDelay)
+
+	log.Println("main: shutting down")
+	cancel()
+	p.Close()
+	wg.Wait()
+
 	return nil
 }

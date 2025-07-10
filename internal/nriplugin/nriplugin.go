@@ -2,6 +2,7 @@ package nriplugin
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -12,6 +13,10 @@ import (
 	"github.com/containerd/ttrpc"
 
 	"github.com/grosskur/basic-nri-plugin/third_party/nri/pkg/api"
+)
+
+const (
+	runBackoff = 2 * time.Second
 )
 
 type Options struct {
@@ -34,20 +39,11 @@ type Plugin struct {
 	idx        string
 	socketPath string
 
-	conn       net.Conn
-	serverOpts []ttrpc.ServerOpt
-	clientOpts []ttrpc.ClientOpts
-
 	rpcm multiplex.Mux
 	rpcl net.Listener
 	rpcs *ttrpc.Server
 	rpcc *ttrpc.Client
 
-	runtime api.RuntimeService
-	started bool
-	doneC   chan struct{}
-	srvErrC chan error
-	cfgErrC chan error
 	syncReq *api.SynchronizeRequest
 
 	registrationTimeout time.Duration
@@ -66,107 +62,7 @@ func New(opts Options) *Plugin {
 	}
 }
 
-func (p *Plugin) start(ctx context.Context) (retErr error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.started {
-		return fmt.Errorf("plugin already started")
-	}
-	p.doneC = make(chan struct{})
-
-	var dialer net.Dialer
-	var err error
-	p.conn, err = dialer.DialContext(ctx, "unix", p.socketPath)
-	if err != nil {
-		return fmt.Errorf("failed to connect to NRI service: %w", err)
-	}
-
-	rpcm := multiplex.Multiplex(p.conn)
-	defer func() {
-		if retErr != nil {
-			rpcm.Close()
-			p.rpcm = nil
-		}
-	}()
-
-	rpcl, err := rpcm.Listen(multiplex.PluginServiceConn)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if retErr != nil {
-			rpcl.Close()
-			p.rpcl = nil
-		}
-	}()
-
-	rpcs, err := ttrpc.NewServer(p.serverOpts...)
-	if err != nil {
-		return fmt.Errorf("failed to create ttrpc server: %w", err)
-	}
-	defer func() {
-		if retErr != nil {
-			rpcs.Close()
-			p.rpcs = nil
-		}
-	}()
-
-	api.RegisterPluginService(rpcs, p)
-
-	conn, err := rpcm.Open(multiplex.RuntimeServiceConn)
-	if err != nil {
-		return fmt.Errorf("failed to multiplex ttrpc client connection: %w", err)
-	}
-
-	clientOpts := []ttrpc.ClientOpts{
-		ttrpc.WithOnClose(func() {
-			p.connClosed()
-		}),
-	}
-	rpcc := ttrpc.NewClient(conn, append(clientOpts, p.clientOpts...)...)
-	defer func() {
-		if retErr != nil {
-			rpcc.Close()
-			p.rpcc = nil
-		}
-	}()
-
-	p.srvErrC = make(chan error, 1)
-	p.cfgErrC = make(chan error, 1)
-
-	go func(l net.Listener, doneC chan struct{}, srvErrC chan error) {
-		srvErrC <- rpcs.Serve(ctx, l)
-		close(doneC)
-	}(rpcl, p.doneC, p.srvErrC)
-
-	p.rpcm = rpcm
-	p.rpcl = rpcl
-	p.rpcs = rpcs
-	p.rpcc = rpcc
-
-	p.runtime = api.NewRuntimeClient(rpcc)
-
-	if err = p.register(ctx); err != nil {
-		p.close()
-		return err
-	}
-
-	if err = <-p.cfgErrC; err != nil {
-		return err
-	}
-
-	log.Printf("nriplugin: started: name=%s", p.Name())
-
-	p.started = true
-	return nil
-}
-
-func (p *Plugin) close() {
-	if !p.started {
-		return
-	}
-
+func (p *Plugin) Close() {
 	if p.rpcl != nil {
 		p.rpcl.Close()
 	}
@@ -179,28 +75,83 @@ func (p *Plugin) close() {
 	if p.rpcm != nil {
 		p.rpcm.Close()
 	}
-	if p.srvErrC != nil {
-		<-p.doneC
-	}
-
-	p.started = false
-	p.conn = nil
 	p.syncReq = nil
 }
 
 func (p *Plugin) Run(ctx context.Context) error {
-	var err error
+	for {
+		if err := p.run(ctx); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
+			log.Printf("nriplugin: error running plugin: %v", err)
+		}
+		log.Printf("nriplugin: sleeping %s", runBackoff)
+		time.Sleep(runBackoff)
+	}
+}
 
-	if err = p.start(ctx); err != nil {
+func (p *Plugin) run(ctx context.Context) error {
+	// Dial and multiplex.
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, "unix", p.socketPath)
+	if err != nil {
+		return fmt.Errorf("failed to connect to NRI service: %w", err)
+	}
+	p.rpcm = multiplex.Multiplex(conn)
+
+	// Create server.
+	p.rpcs, err = ttrpc.NewServer()
+	if err != nil {
+		return fmt.Errorf("failed to create ttrpc server: %w", err)
+	}
+	api.RegisterPluginService(p.rpcs, p)
+
+	// Create client.
+	mconn, err := p.rpcm.Open(multiplex.RuntimeServiceConn)
+	if err != nil {
+		return fmt.Errorf("failed to multiplex ttrpc client connection: %w", err)
+	}
+	clientOpts := []ttrpc.ClientOpts{
+		ttrpc.WithOnClose(func() {
+			p.mu.Lock()
+			p.Close()
+			p.mu.Unlock()
+			log.Println("nriplugin: connection closed")
+		}),
+	}
+	p.rpcc = ttrpc.NewClient(mconn, clientOpts...)
+
+	// Listen and serve.
+	p.rpcl, err = p.rpcm.Listen(multiplex.PluginServiceConn)
+	if err != nil {
 		return err
 	}
 
-	err = <-p.srvErrC
-	if err == ttrpc.ErrServerClosed {
-		log.Printf("nriplugin: connection closed by ttrpc server: %v", err)
+	doneCh := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		if err := p.rpcs.Serve(ctx, p.rpcl); err != nil {
+			log.Printf("nriplugin: RPC server error: %v", err)
+		}
+		close(doneCh)
+		wg.Done()
+	}()
+
+	// Use client to register.
+	if err := p.register(ctx); err != nil {
+		return err
 	}
 
-	return err
+	// Wait.
+	select {
+	case <-ctx.Done():
+	case <-doneCh:
+	}
+	wg.Wait()
+
+	return ctx.Err()
 }
 
 func (p *Plugin) Name() string {
@@ -213,22 +164,16 @@ func (p *Plugin) register(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, p.registrationTimeout)
 	defer cancel()
 
+	runtime := api.NewRuntimeClient(p.rpcc)
 	req := &api.RegisterPluginRequest{
 		PluginName: p.name,
 		PluginIdx:  p.idx,
 	}
-	if _, err := p.runtime.RegisterPlugin(ctx, req); err != nil {
-		return fmt.Errorf("failed to register with runtime: %w", err)
+	if _, err := runtime.RegisterPlugin(ctx, req); err != nil {
+		return fmt.Errorf("failed to register with NRI/Runtime: %w", err)
 	}
 
 	return nil
-}
-
-func (p *Plugin) connClosed() {
-	p.mu.Lock()
-	p.close()
-	p.mu.Unlock()
-	log.Println("nriplugin: connection closed")
 }
 
 func (p *Plugin) Configure(ctx context.Context, req *api.ConfigureRequest) (*api.ConfigureResponse, error) {
@@ -236,8 +181,6 @@ func (p *Plugin) Configure(ctx context.Context, req *api.ConfigureRequest) (*api
 
 	p.registrationTimeout = time.Duration(req.RegistrationTimeout * int64(time.Millisecond))
 	p.requestTimeout = time.Duration(req.RequestTimeout * int64(time.Millisecond))
-
-	p.cfgErrC <- nil
 
 	return &api.ConfigureResponse{
 		Events: int32(p.events),
@@ -248,7 +191,6 @@ func (p *Plugin) Synchronize(ctx context.Context, req *api.SynchronizeRequest) (
 	if req.More {
 		return p.collectSync(req)
 	}
-
 	return p.deliverSync(ctx, req)
 }
 
@@ -262,7 +204,6 @@ func (p *Plugin) collectSync(req *api.SynchronizeRequest) (*api.SynchronizeRespo
 		p.syncReq.Pods = append(p.syncReq.Pods, req.Pods...)
 		p.syncReq.Containers = append(p.syncReq.Containers, req.Containers...)
 	}
-
 	return &api.SynchronizeResponse{More: req.More}, nil
 }
 
@@ -279,24 +220,41 @@ func (p *Plugin) deliverSync(ctx context.Context, req *api.SynchronizeRequest) (
 		syncReq.Containers = append(syncReq.Containers, req.Containers...)
 	}
 
-	for _, pod := range syncReq.Pods {
+	update, err := p.handleSync(ctx, syncReq.Pods, syncReq.Containers)
+	return &api.SynchronizeResponse{
+		Update: update,
+		More:   false,
+	}, err
+}
+
+func (p *Plugin) handleSync(ctx context.Context, pods []*api.PodSandbox, containers []*api.Container) ([]*api.ContainerUpdate, error) {
+	for _, pod := range pods {
 		log.Printf("nriplugin: Synchronize: pod-uid=%+v", pod.Uid)
 	}
-
-	return &api.SynchronizeResponse{
-		Update: []*api.ContainerUpdate{},
-		More:   false,
-	}, nil
+	return []*api.ContainerUpdate{}, nil
 }
 
 func (p *Plugin) Shutdown(ctx context.Context, _ *api.Empty) (*api.Empty, error) {
-	log.Println("hook: Shutdown")
+	log.Println("nriplugin: Shutdown")
 	return &api.Empty{}, nil
 }
 
-func (p *Plugin) StateChange(ctx context.Context, evt *api.StateChangeEvent) (*api.Empty, error) {
-	var err error
+func (p *Plugin) CreateContainer(ctx context.Context, req *api.CreateContainerRequest) (*api.CreateContainerResponse, error) {
+	log.Printf("nriplugin: CreateContainer: pod-uid=%s", req.Pod.Uid)
+	return &api.CreateContainerResponse{}, nil
+}
 
+func (p *Plugin) StopContainer(ctx context.Context, req *api.StopContainerRequest) (*api.StopContainerResponse, error) {
+	log.Printf("nriplugin: StopContainer: pod-uid=%s", req.Pod.Uid)
+	return &api.StopContainerResponse{}, nil
+}
+
+func (p *Plugin) UpdateContainer(ctx context.Context, req *api.UpdateContainerRequest) (*api.UpdateContainerResponse, error) {
+	log.Printf("nriplugin: UpdateContainer: pod-uid=%s", req.Pod.Uid)
+	return &api.UpdateContainerResponse{}, nil
+}
+
+func (p *Plugin) StateChange(ctx context.Context, evt *api.StateChangeEvent) (*api.Empty, error) {
 	switch evt.Event {
 	case api.Event_RUN_POD_SANDBOX:
 		log.Printf("nriplugin: StateChange: event=RunPodSandbox pod-uid=%s", evt.Pod.Uid)
@@ -317,21 +275,5 @@ func (p *Plugin) StateChange(ctx context.Context, evt *api.StateChangeEvent) (*a
 	default:
 		log.Printf("nriplugin: StateChange: unknown event: %s", evt.Event)
 	}
-
-	return &api.Empty{}, err
-}
-
-func (p *Plugin) CreateContainer(ctx context.Context, req *api.CreateContainerRequest) (*api.CreateContainerResponse, error) {
-	log.Printf("nriplugin: CreateContainer: pod-uid=%s", req.Pod.Uid)
-	return &api.CreateContainerResponse{}, nil
-}
-
-func (p *Plugin) StopContainer(ctx context.Context, req *api.StopContainerRequest) (*api.StopContainerResponse, error) {
-	log.Printf("nriplugin: StopContainer: pod-uid=%s", req.Pod.Uid)
-	return &api.StopContainerResponse{}, nil
-}
-
-func (p *Plugin) UpdateContainer(ctx context.Context, req *api.UpdateContainerRequest) (*api.UpdateContainerResponse, error) {
-	log.Printf("nriplugin: UpdateContainer: pod-uid=%s", req.Pod.Uid)
-	return &api.UpdateContainerResponse{}, nil
+	return &api.Empty{}, nil
 }
